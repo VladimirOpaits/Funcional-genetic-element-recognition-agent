@@ -17,56 +17,49 @@ class GeneticDataProcessor:
         ).to(device)
         self.model.eval()
 
-    def load_fasta_sequences(self, directory: str) -> Dict[str, str]:
-        sequences = {}
-        fasta_dir = Path(directory)
-
-        for fasta_file in fasta_dir.glob("*"):
-            if fasta_file.is_file():
-                try:
-                    for record in SeqIO.parse(str(fasta_file), "fasta"):
-                        sequences[record.id] = str(record.seq)
-                except Exception as e:
-                    print(f"Error reading {fasta_file}: {e}")
-
-        return sequences
-
     def get_embeddings(self, sequence: str) -> torch.Tensor:
         inputs = self.tokenizer(sequence, return_tensors="pt", max_length=1024, truncation=True).to(self.device)
 
         with torch.no_grad():
             outputs = self.model(**inputs, output_hidden_states=True)
 
-        embeddings = outputs.hidden_states[-1]
-        return embeddings
+        return outputs.hidden_states[-1]
 
-    def process_dataset(self, data_dir: str):
-        positives_dir = os.path.join(data_dir, "positives")
-        negatives_dir = os.path.join(data_dir, "negatives")
+    def process_dataset(self, data_dir: str) -> Tuple[Dict[str, Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]:
+        positives_dir = Path(os.path.join(data_dir, "positives"))
+        negatives_dir = Path(os.path.join(data_dir, "negatives"))
 
-        int_embeddings = {}
-        rt_embeddings = {}
-        negatives_embeddings = {}
+        categories: Dict[str, Dict[str, torch.Tensor]] = {}
+        negatives: Dict[str, torch.Tensor] = {}
 
-        if os.path.exists(positives_dir):
+        if positives_dir.exists():
             print("Processing positives...")
-            pos_sequences = self.load_fasta_sequences(positives_dir)
-            for name, seq in pos_sequences.items():
-                if len(seq) > 0:
-                    emb = self.get_embeddings(seq).cpu()
-                    if name.startswith("INT"):
-                        int_embeddings[name] = emb
-                    elif name.startswith("RT"):
-                        rt_embeddings[name] = emb
+            for fasta_file in sorted(positives_dir.glob("*")):
+                if not fasta_file.is_file():
+                    continue
+                category = fasta_file.stem.split("_")[0]
+                if category not in categories:
+                    categories[category] = {}
+                try:
+                    for record in SeqIO.parse(str(fasta_file), "fasta"):
+                        if len(record.seq) > 0:
+                            categories[category][record.id] = self.get_embeddings(str(record.seq)).cpu()
+                except Exception as e:
+                    print(f"Error reading {fasta_file.name}: {e}")
 
-        if os.path.exists(negatives_dir):
+        if negatives_dir.exists():
             print("Processing negatives...")
-            neg_sequences = self.load_fasta_sequences(negatives_dir)
-            for name, seq in neg_sequences.items():
-                if len(seq) > 0:
-                    negatives_embeddings[name] = self.get_embeddings(seq).cpu()
+            for fasta_file in negatives_dir.glob("*"):
+                if not fasta_file.is_file():
+                    continue
+                try:
+                    for record in SeqIO.parse(str(fasta_file), "fasta"):
+                        if len(record.seq) > 0:
+                            negatives[record.id] = self.get_embeddings(str(record.seq)).cpu()
+                except Exception as e:
+                    print(f"Error reading {fasta_file.name}: {e}")
 
-        return int_embeddings, rt_embeddings, negatives_embeddings
+        return categories, negatives
 
 
 if __name__ == "__main__":
@@ -74,13 +67,13 @@ if __name__ == "__main__":
     data_dir = os.path.join(os.path.dirname(__file__), "..", "data")
 
     try:
-        int_emb, rt_emb, neg_emb = processor.process_dataset(data_dir)
-        print(f"INT: {len(int_emb)}")
-        print(f"RT: {len(rt_emb)}")
-        print(f"Negatives: {len(neg_emb)}")
+        categories, neg_emb = processor.process_dataset(data_dir)
 
-        torch.save(int_emb, "INT_embeddings.pt")
-        torch.save(rt_emb, "RT_embeddings.pt")
+        for category, emb in categories.items():
+            print(f"{category}: {len(emb)}")
+            torch.save(emb, f"{category}_embeddings.pt")
+
+        print(f"Negatives: {len(neg_emb)}")
         torch.save(neg_emb, "negatives_embeddings.pt")
 
     except Exception as e:
