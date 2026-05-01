@@ -25,39 +25,62 @@ class GeneticDataProcessor:
 
         return outputs.hidden_states[-1]
 
+    @staticmethod
+    def _iter_fasta_files(root: Path):
+        """Recursively yield FASTA-like files. Accepts files with or without extensions."""
+        if not root.exists():
+            return
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                yield path
+
+    @staticmethod
+    def _category_from_filename(path: Path) -> str:
+        """
+        Map a file to its category, supporting both naming schemes:
+          old:  RT_copia, INT_gypsy, RNaseH_athila      -> 'RT' / 'INT' / 'RNaseH'
+          new:  retro_domains/RT.fasta                  -> 'RT'
+        """
+        return path.stem.split("_")[0]
+
+    def _embed_fasta(self, path: Path, store: Dict[str, torch.Tensor]) -> int:
+        """Parse one FASTA, embed each non-empty sequence, write into store. Returns count."""
+        added = 0
+        try:
+            for record in SeqIO.parse(str(path), "fasta"):
+                if len(record.seq) == 0:
+                    continue
+                # Prefix with file stem so identical record IDs from different
+                # source files (or repeated mat_peptides in one NCBI record)
+                # don't overwrite each other.
+                key = f"{path.stem}:{record.id}"
+                if key in store:
+                    key = f"{path.stem}:{record.id}#{added}"
+                store[key] = self.get_embeddings(str(record.seq)).cpu()
+                added += 1
+        except Exception as e:
+            print(f"Error reading {path.name}: {e}")
+        return added
+
     def process_dataset(self, data_dir: str) -> Tuple[Dict[str, Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]:
-        positives_dir = Path(os.path.join(data_dir, "positives"))
-        negatives_dir = Path(os.path.join(data_dir, "negatives"))
+        data_path = Path(data_dir)
+        positives_dir = data_path / "positives"
+        negatives_dir = data_path / "negatives"
 
         categories: Dict[str, Dict[str, torch.Tensor]] = {}
         negatives: Dict[str, torch.Tensor] = {}
 
-        if positives_dir.exists():
-            print("Processing positives...")
-            for fasta_file in sorted(positives_dir.glob("*")):
-                if not fasta_file.is_file():
-                    continue
-                category = fasta_file.stem.split("_")[0]
-                if category not in categories:
-                    categories[category] = {}
-                try:
-                    for record in SeqIO.parse(str(fasta_file), "fasta"):
-                        if len(record.seq) > 0:
-                            categories[category][record.id] = self.get_embeddings(str(record.seq)).cpu()
-                except Exception as e:
-                    print(f"Error reading {fasta_file.name}: {e}")
+        print("Processing positives...")
+        for fasta_file in self._iter_fasta_files(positives_dir):
+            category = self._category_from_filename(fasta_file)
+            store = categories.setdefault(category, {})
+            n = self._embed_fasta(fasta_file, store)
+            print(f"  {fasta_file.relative_to(positives_dir)} -> {category}: +{n} (total {len(store)})")
 
-        if negatives_dir.exists():
-            print("Processing negatives...")
-            for fasta_file in negatives_dir.glob("*"):
-                if not fasta_file.is_file():
-                    continue
-                try:
-                    for record in SeqIO.parse(str(fasta_file), "fasta"):
-                        if len(record.seq) > 0:
-                            negatives[record.id] = self.get_embeddings(str(record.seq)).cpu()
-                except Exception as e:
-                    print(f"Error reading {fasta_file.name}: {e}")
+        print("Processing negatives...")
+        for fasta_file in self._iter_fasta_files(negatives_dir):
+            n = self._embed_fasta(fasta_file, negatives)
+            print(f"  {fasta_file.relative_to(negatives_dir)}: +{n} (total {len(negatives)})")
 
         return categories, negatives
 
