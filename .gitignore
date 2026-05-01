@@ -3,3 +3,4 @@ data
 __pycache__
 .claude
 data_code/*.pt
+CLAUDE.md
