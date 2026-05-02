@@ -1,33 +1,28 @@
 import os
+import sys
 import torch
 from pathlib import Path
 from typing import Dict, Tuple
 from Bio import SeqIO
-from transformers import AutoTokenizer, AutoModelForMaskedLM
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src.nt_model import NucleotideTransformer
 
 
 class GeneticDataProcessor:
-    def __init__(self, model_name: str = "InstaDeepAI/nucleotide-transformer-v2-50m-multi-species", device: str = "cuda"):
-        self.model_name = model_name
-        self.device = device
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        self.model = AutoModelForMaskedLM.from_pretrained(
-            model_name,
-            trust_remote_code=True
-        ).to(device)
-        self.model.eval()
+    def __init__(
+        self,
+        nt: NucleotideTransformer = None,
+        model_name: str = "InstaDeepAI/nucleotide-transformer-v2-50m-multi-species",
+        device: str = "cuda",
+    ):
+        self.nt = nt or NucleotideTransformer(model_name=model_name, device=device)
 
     def get_embeddings(self, sequence: str) -> torch.Tensor:
-        inputs = self.tokenizer(sequence, return_tensors="pt", max_length=1024, truncation=True).to(self.device)
-
-        with torch.no_grad():
-            outputs = self.model(**inputs, output_hidden_states=True)
-
-        return outputs.hidden_states[-1]
+        return self.nt.embed(sequence)
 
     @staticmethod
     def _iter_fasta_files(root: Path):
-        """Recursively yield FASTA-like files. Accepts files with or without extensions."""
         if not root.exists():
             return
         for path in sorted(root.rglob("*")):
@@ -36,27 +31,18 @@ class GeneticDataProcessor:
 
     @staticmethod
     def _category_from_filename(path: Path) -> str:
-        """
-        Map a file to its category, supporting both naming schemes:
-          old:  RT_copia, INT_gypsy, RNaseH_athila      -> 'RT' / 'INT' / 'RNaseH'
-          new:  retro_domains/RT.fasta                  -> 'RT'
-        """
         return path.stem.split("_")[0]
 
     def _embed_fasta(self, path: Path, store: Dict[str, torch.Tensor]) -> int:
-        """Parse one FASTA, embed each non-empty sequence, write into store. Returns count."""
         added = 0
         try:
             for record in SeqIO.parse(str(path), "fasta"):
                 if len(record.seq) == 0:
                     continue
-                # Prefix with file stem so identical record IDs from different
-                # source files (or repeated mat_peptides in one NCBI record)
-                # don't overwrite each other.
                 key = f"{path.stem}:{record.id}"
                 if key in store:
                     key = f"{path.stem}:{record.id}#{added}"
-                store[key] = self.get_embeddings(str(record.seq)).cpu()
+                store[key] = self.get_embeddings(str(record.seq))
                 added += 1
         except Exception as e:
             print(f"Error reading {path.name}: {e}")

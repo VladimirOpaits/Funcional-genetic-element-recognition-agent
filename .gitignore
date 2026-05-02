@@ -4,3 +4,5 @@ __pycache__
 .claude
 data_code/*.pt
 CLAUDE.md
+data_code/annotated_shards
+data_code/annotated_eval_manifest.json
