@@ -1,10 +1,12 @@
-import gc
+import argparse
+import io
 import json
+import os
 import sys
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-import numpy as np
+import fsspec
 import torch
 from Bio import SeqIO
 
@@ -12,30 +14,49 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.nt_model import NucleotideTransformer
 
 
-CLASSES = ["INT", "RT", "RN", "GAG"]
+CLASSES = ["GAG", "INT", "RT", "RN", "LTR"]
 CLASS_TO_IDX = {c: i for i, c in enumerate(CLASSES)}
 NUM_CLASSES = len(CLASSES)
 
 DEFAULT_CHUNK_BP = 6000
 DEFAULT_STRIDE_BP = 6000
-EMB_DTYPE = torch.float16
-DEFAULT_CHUNKS_PER_SHARD = 256
+
+
+def open_text(uri: str, mode: str = "r"):
+    return fsspec.open(uri, mode)
+
+
+def torch_save_uri(obj, uri: str) -> None:
+    fs, path = fsspec.core.url_to_fs(uri)
+    parent = path.rsplit("/", 1)[0] if "/" in path else ""
+    if parent:
+        fs.makedirs(parent, exist_ok=True)
+    buf = io.BytesIO()
+    torch.save(obj, buf)
+    buf.seek(0)
+    with fs.open(path, "wb") as f:
+        f.write(buf.read())
+
+
+def read_fasta_uri(uri: str):
+    with fsspec.open(uri, "r") as f:
+        text = f.read()
+    return next(SeqIO.parse(io.StringIO(text), "fasta"))
 
 
 class AnnotatedTokenLabeler:
+
     def __init__(
         self,
         nt: Optional[NucleotideTransformer] = None,
         chunk_bp: int = DEFAULT_CHUNK_BP,
         stride_bp: int = DEFAULT_STRIDE_BP,
         max_chunks_per_seq: Optional[int] = None,
-        emb_dtype: torch.dtype = EMB_DTYPE,
     ):
         self.nt = nt or NucleotideTransformer()
         self.chunk_bp = chunk_bp
         self.stride_bp = stride_bp
         self.max_chunks_per_seq = max_chunks_per_seq
-        self.emb_dtype = emb_dtype
 
     @staticmethod
     def _multi_label_for_span(
@@ -56,11 +77,12 @@ class AnnotatedTokenLabeler:
                     break
         return label
 
-    def iter_chunks(
+    def process_sequence(
         self,
         full_seq: str,
         domains: Dict[str, List[Tuple[int, int]]],
-    ) -> Iterator[Dict]:
+    ) -> List[Dict]:
+        chunks: List[Dict] = []
         seq_len = len(full_seq)
         chunk_count = 0
 
@@ -70,10 +92,8 @@ class AnnotatedTokenLabeler:
             if len(chunk_seq) < 50:
                 break
 
-            with torch.no_grad():
-                embeddings, offsets = self.nt.embed_with_offsets(chunk_seq)
-            embeddings = embeddings.squeeze(0).to(self.emb_dtype).contiguous()
-            num_tokens = embeddings.shape[0]
+            embeddings, offsets = self.nt.embed_with_offsets(chunk_seq)
+            num_tokens = embeddings.shape[1]
 
             token_labels = torch.zeros(num_tokens, NUM_CLASSES, dtype=torch.float32)
             global_offsets: List[Tuple[int, int]] = []
@@ -83,13 +103,13 @@ class AnnotatedTokenLabeler:
                 global_offsets.append((gstart, gend))
                 token_labels[i] = self._multi_label_for_span(gstart, gend, domains)
 
-            yield {
+            chunks.append({
                 "chunk_start": chunk_start,
                 "chunk_end": chunk_end,
-                "embeddings": embeddings,
+                "embeddings": embeddings.squeeze(0),
                 "labels": token_labels,
                 "token_offsets": global_offsets,
-            }
+            })
 
             chunk_count += 1
             if self.max_chunks_per_seq is not None and chunk_count >= self.max_chunks_per_seq:
@@ -97,203 +117,138 @@ class AnnotatedTokenLabeler:
             if chunk_end == seq_len:
                 break
 
-    def process_dataset_to_shards(
+        return chunks
+
+    def process_dataset(
         self,
-        annotations_path: Path,
-        sequences_dir: Path,
-        shard_dir: Path,
-        chunks_per_shard: int = DEFAULT_CHUNKS_PER_SHARD,
-    ) -> List[Dict]:
-        annotations_path = Path(annotations_path)
-        sequences_dir = Path(sequences_dir)
-        shard_dir = Path(shard_dir)
-        shard_dir.mkdir(parents=True, exist_ok=True)
-
-        manifest: List[Dict] = []
-
-        with open(annotations_path) as f:
+        annotations_uri: str,
+        sequences_uri: str,
+    ) -> Dict[str, Dict]:
+        with open_text(annotations_uri, "r") as f:
             annotations = json.load(f)
 
+        sequences_uri = sequences_uri.rstrip("/")
+        ann_parent = annotations_uri.rsplit("/", 1)[0] if "/" in annotations_uri else "."
+
+        result: Dict[str, Dict] = {}
         for ann in annotations:
             accession = ann["accession"]
-            fasta_path = sequences_dir / f"{accession}.fasta"
-            if not fasta_path.exists():
-                fasta_path = annotations_path.parent / ann["file"]
-            if not fasta_path.exists():
+            candidates = [
+                f"{sequences_uri}/{accession}.fasta",
+                f"{ann_parent}/{ann.get('file', '')}",
+            ]
+            record = None
+            for uri in candidates:
+                if not uri or uri.endswith("/"):
+                    continue
+                try:
+                    record = read_fasta_uri(uri)
+                    break
+                except FileNotFoundError:
+                    continue
+                except Exception as e:
+                    print(f"Error reading {uri}: {e}")
+            if record is None:
                 print(f"Missing FASTA: {accession}, skipping")
                 continue
 
-            try:
-                record = next(SeqIO.parse(str(fasta_path), "fasta"))
-            except Exception as e:
-                print(f"Error reading {accession}: {e}")
-                continue
-
             full_seq = str(record.seq).upper()
-            domains = {k: [tuple(x) for x in v] for k, v in ann["domains"].items()}
+            domains = {k: [tuple(x) for x in v] for k, v in ann["domains"].items() if k in CLASS_TO_IDX}
 
             print(f"Processing {accession} ({len(full_seq)} bp)...", flush=True)
-
-            buffer: List[Dict] = []
-            shard_idx = 0
-            total_chunks = 0
+            chunks = self.process_sequence(full_seq, domains)
             pos_counts = torch.zeros(NUM_CLASSES)
-            shard_files: List[str] = []
-
-            def flush():
-                nonlocal shard_idx, buffer
-                if not buffer:
-                    return
-                shard_path = shard_dir / f"{accession}_{shard_idx:04d}.pt"
-                torch.save(
-                    {
-                        "accession": accession,
-                        "shard_idx": shard_idx,
-                        "domains": domains,
-                        "chunks": buffer,
-                    },
-                    shard_path,
-                )
-                shard_files.append(str(shard_path.relative_to(shard_dir.parent)))
-                print(f"  wrote {shard_path.name} ({len(buffer)} chunks)", flush=True)
-                shard_idx += 1
-                buffer = []
-                gc.collect()
-
-            for chunk in self.iter_chunks(full_seq, domains):
-                pos_counts += chunk["labels"].sum(dim=0)
-                buffer.append(chunk)
-                total_chunks += 1
-                if len(buffer) >= chunks_per_shard:
-                    flush()
-            flush()
-
+            for c in chunks:
+                pos_counts += c["labels"].sum(dim=0)
             stats = ", ".join(f"{name}={int(pos_counts[i])}" for i, name in enumerate(CLASSES))
-            print(f"  -> {total_chunks} chunks total; positive tokens per class: {stats}")
+            print(f"  -> {len(chunks)} chunks; positive tokens per class: {stats}")
 
-            manifest.append({
-                "accession": accession,
+            result[accession] = {
                 "length": len(full_seq),
-                "num_chunks": total_chunks,
-                "shards": shard_files,
-            })
+                "domains": domains,
+                "chunks": chunks,
+            }
 
-            with open(shard_dir.parent / "annotated_eval_manifest.json", "w") as f:
-                json.dump(manifest, f, indent=2)
-
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        return manifest
+        return result
 
 
-def iter_shard_chunks(shard_dir: Path) -> Iterator[Dict]:
-    shard_dir = Path(shard_dir)
-    for shard_path in sorted(shard_dir.glob("*.pt")):
-        entry = torch.load(shard_path, map_location="cpu", weights_only=False)
-        for chunk in entry["chunks"]:
-            yield chunk
-        del entry
-        gc.collect()
-
-
-def write_flat_streaming(
-    shard_dir: Path,
-    out_dir: Path,
+def flatten_chunks(
+    dataset: Dict[str, Dict],
     drop_specials: bool = True,
-) -> Tuple[Tuple[int, int], Tuple[int, int]]:
-    """Two-pass flatten using numpy memmaps so the full (X, Y) never
-    has to fit in RAM. Writes ``X.npy``-style memmap and ``Y.npy``
-    memmap plus a small ``flat_meta.json`` describing shapes/dtypes.
-    """
-    shard_dir = Path(shard_dir)
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    xs: List[torch.Tensor] = []
+    ys: List[torch.Tensor] = []
+    for entry in dataset.values():
+        for chunk in entry["chunks"]:
+            emb = chunk["embeddings"]
+            lab = chunk["labels"]
+            if drop_specials:
+                keep = torch.tensor(
+                    [s != e for s, e in chunk["token_offsets"]],
+                    dtype=torch.bool,
+                )
+                emb = emb[keep]
+                lab = lab[keep]
+            xs.append(emb)
+            ys.append(lab)
+    if not xs:
+        return torch.empty(0), torch.empty(0, NUM_CLASSES)
+    return torch.cat(xs, dim=0), torch.cat(ys, dim=0)
 
-    total_tokens = 0
-    hidden_dim = None
-    emb_np_dtype = None
-    for chunk in iter_shard_chunks(shard_dir):
-        emb = chunk["embeddings"]
-        if drop_specials:
-            keep_n = sum(1 for s, e in chunk["token_offsets"] if s != e)
-        else:
-            keep_n = emb.shape[0]
-        total_tokens += keep_n
-        if hidden_dim is None:
-            hidden_dim = emb.shape[1]
-            emb_np_dtype = np.dtype("float16") if emb.dtype == torch.float16 else np.dtype("float32")
 
-    x_path = out_dir / "X.f16.dat"
-    y_path = out_dir / "Y.f32.dat"
-    meta_path = out_dir / "flat_meta.json"
+def default_input_uri() -> str:
+    bucket = os.environ.get("GCS_BUCKET")
+    prefix = os.environ.get("GCS_PREFIX", "annotated_sequences")
+    if bucket:
+        return f"gs://{bucket}/{prefix}"
+    return str((Path(__file__).resolve().parent.parent / "data" / "annotated_sequences").as_posix())
 
-    if total_tokens == 0:
-        meta = {"x_shape": [0, 0], "y_shape": [0, NUM_CLASSES], "x_dtype": "float16",
-                "y_dtype": "float32", "classes": CLASSES,
-                "x_path": x_path.name, "y_path": y_path.name}
-        with open(meta_path, "w") as f:
-            json.dump(meta, f, indent=2)
-        return (0, 0), (0, NUM_CLASSES)
 
-    X = np.memmap(x_path, dtype=emb_np_dtype, mode="w+", shape=(total_tokens, hidden_dim))
-    Y = np.memmap(y_path, dtype=np.float32, mode="w+", shape=(total_tokens, NUM_CLASSES))
+def default_output_uri() -> str:
+    bucket = os.environ.get("GCS_BUCKET")
+    prefix = os.environ.get("GCS_OUTPUT_PREFIX", "annotated_eval")
+    if bucket:
+        return f"gs://{bucket}/{prefix}"
+    return str(Path(__file__).resolve().parent.as_posix())
 
-    cursor = 0
-    for chunk in iter_shard_chunks(shard_dir):
-        emb = chunk["embeddings"]
-        lab = chunk["labels"]
-        if drop_specials:
-            keep = torch.tensor(
-                [s != e for s, e in chunk["token_offsets"]],
-                dtype=torch.bool,
-            )
-            emb = emb[keep]
-            lab = lab[keep]
-        n = emb.shape[0]
-        X[cursor:cursor + n] = emb.numpy()
-        Y[cursor:cursor + n] = lab.numpy()
-        cursor += n
 
-    X.flush()
-    Y.flush()
-    del X, Y
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", default=default_input_uri(), help="dir with annotations.json and sequences/")
+    parser.add_argument("--output", default=default_output_uri(), help="dir to write .pt files (local or gs://)")
+    parser.add_argument("--chunk-bp", type=int, default=DEFAULT_CHUNK_BP)
+    parser.add_argument("--stride-bp", type=int, default=DEFAULT_STRIDE_BP)
+    parser.add_argument("--max-chunks", type=int, default=None)
+    args = parser.parse_args()
 
-    meta = {
-        "x_shape": [total_tokens, hidden_dim],
-        "y_shape": [total_tokens, NUM_CLASSES],
-        "x_dtype": str(emb_np_dtype),
-        "y_dtype": "float32",
-        "classes": CLASSES,
-        "x_path": x_path.name,
-        "y_path": y_path.name,
-    }
-    with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2)
+    base = args.input.rstrip("/")
+    annotations_uri = f"{base}/annotations.json"
+    sequences_uri = f"{base}/sequences"
+    out_base = args.output.rstrip("/")
 
-    return (total_tokens, hidden_dim), (total_tokens, NUM_CLASSES)
+    print(f"Input:  {base}")
+    print(f"Output: {out_base}")
+
+    labeler = AnnotatedTokenLabeler(
+        chunk_bp=args.chunk_bp,
+        stride_bp=args.stride_bp,
+        max_chunks_per_seq=args.max_chunks,
+    )
+    dataset = labeler.process_dataset(annotations_uri, sequences_uri)
+
+    out_dataset = f"{out_base}/annotated_eval_dataset.pt"
+    torch_save_uri(dataset, out_dataset)
+    print(f"\nSaved per-sequence dataset -> {out_dataset}")
+
+    X, Y = flatten_chunks(dataset)
+    out_flat = f"{out_base}/annotated_eval_flat.pt"
+    torch_save_uri({"X": X, "Y": Y, "classes": CLASSES}, out_flat)
+    print(f"Saved flat (X, Y) -> {out_flat}")
+    print(f"Shapes: X={tuple(X.shape)}, Y={tuple(Y.shape)}")
+    if Y.numel() > 0:
+        per_class = Y.sum(dim=0).int().tolist()
+        print(f"Positive tokens per class: {dict(zip(CLASSES, per_class))}")
 
 
 if __name__ == "__main__":
-    project_root = Path(__file__).resolve().parent.parent
-    base = project_root / "data" / "annotated_sequences"
-    shard_dir = Path(__file__).parent / "annotated_shards"
-
-    labeler = AnnotatedTokenLabeler()
-    manifest = labeler.process_dataset_to_shards(
-        annotations_path=base / "annotations.json",
-        sequences_dir=base / "sequences",
-        shard_dir=shard_dir,
-    )
-
-    manifest_path = Path(__file__).parent / "annotated_eval_manifest.json"
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
-    print(f"\nSaved manifest -> {manifest_path}")
-    print(f"Per-sequence shards -> {shard_dir}")
-
-    flat_dir = Path(__file__).parent / "annotated_eval_flat"
-    x_shape, y_shape = write_flat_streaming(shard_dir, flat_dir)
-    print(f"Saved flat memmap (X, Y) -> {flat_dir}")
-    print(f"Shapes: X={x_shape}, Y={y_shape}")
+    main()
